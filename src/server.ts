@@ -7,32 +7,16 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import * as v from "valibot";
 import { loadWorkflows } from "./workflow-loader.js";
-import { TaskStore } from "./task-store.js";
-import { createDb } from "./db/index.js";
-import {
-  listWorkflows,
-  runWorkflow,
-  completeTask,
-  rejectTask,
-  getStatus,
-  findRootTaskId,
-  getSettledGroup,
-} from "./handlers.js";
-import type { Workflow, Task } from "./types.js";
 import { runWorkflowFile } from "./job-runner.js";
-import { defaults, serverUrl, type ServerConfig } from "./config.js";
+import { runActrunCommand } from "./actrun-cli.js";
 import { createDefaultVerifier, runIntentGate, type EvidenceVerifier } from "./intent-gate.js";
+import { defaults, serverUrl, type ServerConfig } from "./config.js";
+import type { Workflow } from "./types.js";
 import {
   RunArgsSchema,
-  DoneArgsSchema,
-  RejectArgsSchema,
   StatusArgsSchema,
   RegisterTranscriptArgsSchema,
-  type RunResponse,
-  type DoneResponse,
-  type RejectResponse,
-  type GroupDoneNotification,
-} from "./db/dto.js";
+} from "./dto.js";
 
 function textResponse(text: string) {
   return { content: [{ type: "text" as const, text }] };
@@ -50,105 +34,49 @@ function validationError(issues: v.BaseIssue<unknown>[]) {
   return errorResponse(`Invalid arguments: ${issues.map((i) => i.message).join("; ")}`);
 }
 
-type NotifyFn = (event: string, params: Record<string, unknown>) => void;
-
-function notifyCaller(
-  notifiers: Map<string, NotifyFn>,
-  callerId: string | undefined,
-  event: string,
-  params: Record<string, unknown>,
-) {
-  if (!callerId) return;
-  notifiers.get(callerId)?.(event, params);
-}
-
-function notifyTaskResult(
-  notifiers: Map<string, NotifyFn>,
-  store: TaskStore,
-  task: Task,
-  event: string,
-  extra: Record<string, unknown>,
-) {
-  const rootId = findRootTaskId(store, task.id);
-  const rootTask = rootId !== task.id ? store.get(rootId) : task;
-  notifyCaller(notifiers, task.caller, event, {
-    taskId: rootId,
-    title: (rootTask ?? task).title,
-    ...extra,
-  });
-}
-
-function notifyIfGroupSettled(
-  notifiers: Map<string, NotifyFn>,
-  store: TaskStore,
-  task: Task,
-) {
-  const settled = getSettledGroup(store, task);
-  if (!settled) return;
-  const payload: GroupDoneNotification = {
-    group: settled.group,
-    tasks: settled.tasks.map((t) => ({ taskId: t.id, title: t.title, status: t.status })),
-  };
-  notifyCaller(notifiers, task.caller, "group.done", payload);
-}
-
 const TOOL_DEFINITIONS = [
   {
     name: "workflows",
-    description: "Call first to discover available task types before using run. Returns each workflow's type, description, required inputs, and whether user confirmation is needed.",
+    description: "Call first to discover available workflows before using run. Returns each workflow's type, description, required inputs, and whether user confirmation is needed.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
     name: "run",
-    description: "Delegate a task to a worker. Call when you can fill all required inputs for a workflow. Evidenced inputs must include citations — actrun-mcp verifies them before accepting. The worker is spawned automatically.",
+    description: "Execute a workflow via actrun. Call when you can fill all required inputs. Evidenced inputs must include citations — verified before execution starts.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        type: { type: "string", description: "Workflow type from workflows tool (e.g. dev/impl)" },
-        title: { type: "string", description: "Human-readable task title. Should be specific enough for the worker to understand the goal." },
-        inputs: { type: "object", description: "Key-value map matching the workflow's required inputs. Each value is either {type:'plain', value:string} for simple values, or {type:'evidenced', body:string, citations:[...]} when the input is based on conversation or existing sources." },
-        group: { type: "string", description: "Optional. Group ID for batching parallel tasks." },
+        type: { type: "string", description: "Workflow type from workflows tool (e.g. dev/implement)" },
+        inputs: { type: "object", description: "Key-value map matching the workflow's required inputs. Each value is either {type:'plain', value:string} or {type:'evidenced', body:string, citations:[...]}." },
       },
-      required: ["type", "title", "inputs"],
-    },
-  },
-  {
-    name: "done",
-    description: "Report task completion. Call when the assigned work is finished. If the workflow defines outputs, they must be included.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        taskId: { type: "string", description: "Task ID received in the task prompt" },
-        output: { type: "object", description: "Key-value output. Must include all keys listed in the task's Outputs section." },
-      },
-      required: ["taskId", "output"],
-    },
-  },
-  {
-    name: "reject",
-    description: "Reject a task and return it to the caller. Call when inputs are insufficient or the task cannot be completed. Do not start work — reject immediately.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        taskId: { type: "string", description: "Task ID received in the task prompt" },
-        reason: { type: "string", description: "Why the task cannot proceed. Be specific so the caller can fix the inputs." },
-      },
-      required: ["taskId", "reason"],
+      required: ["type", "inputs"],
     },
   },
   {
     name: "status",
-    description: "Check task progress. Call to monitor running tasks or verify completion.",
+    description: "Check workflow execution status. Returns job/step level details from actrun's run store.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        taskId: { type: "string", description: "Specific task ID to check. Omit to get all tasks." },
+        runId: { type: "string", description: "Run ID from a previous run call. Omit to list recent runs." },
       },
     },
   },
   {
+    name: "logs",
+    description: "Get execution logs for a workflow run.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        runId: { type: "string", description: "Run ID to get logs for" },
+        failedOnly: { type: "boolean", description: "Only show failed task logs" },
+      },
+      required: ["runId"],
+    },
+  },
+  {
     name: "register-transcript",
-    description: "Register the conversation transcript path. Called automatically by the SessionStart hook — typically not called manually.",
+    description: "Register the conversation transcript path. Called automatically by the SessionStart hook.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -159,19 +87,21 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
+const LogsArgsSchema = v.object({
+  runId: v.pipe(v.string(), v.minLength(1)),
+  failedOnly: v.optional(v.boolean()),
+});
 
 interface McpContext {
   workflows: Map<string, Workflow>;
-  store: TaskStore;
-  callerId: string;
-  notifiers: Map<string, NotifyFn>;
   transcriptStore: { path?: string };
   verifyEvidence?: EvidenceVerifier;
   cwd: string;
 }
 
 function configureMcpServer(server: Server, ctx: McpContext) {
-  const { workflows, store, callerId, notifiers, transcriptStore, verifyEvidence, cwd } = ctx;
+  const { workflows, transcriptStore, verifyEvidence, cwd } = ctx;
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOL_DEFINITIONS,
   }));
@@ -180,63 +110,35 @@ function configureMcpServer(server: Server, ctx: McpContext) {
     const { name, arguments: args } = request.params;
 
     switch (name) {
-      case "workflows":
-        return jsonResponse(listWorkflows(workflows));
+      case "workflows": {
+        const list = [...workflows.values()]
+          .filter((w) => !w.frontmatter.internal)
+          .map((w) => ({
+            type: w.type,
+            description: w.frontmatter.description,
+            inputs: w.frontmatter.inputs,
+            "confirm-before-run": w.frontmatter["confirm-before-run"],
+          }));
+        return jsonResponse(list);
+      }
 
       case "run": {
         const parsed = v.safeParse(RunArgsSchema, args);
         if (!parsed.success) return validationError(parsed.issues);
+
+        const workflow = workflows.get(parsed.output.type);
+        if (!workflow) return errorResponse(`Unknown workflow: ${parsed.output.type}`);
 
         if (verifyEvidence) {
           const gate = await runIntentGate(parsed.output.inputs, verifyEvidence, transcriptStore.path);
           if (gate.isErr()) return errorResponse(gate.error);
         }
 
-        return runWorkflow(workflows, store, { ...parsed.output, caller: callerId, transcriptPath: transcriptStore.path }).match(
-          (data) => {
-            const workflowPath = `.claude/workflows/${data.task.type}.yml`;
-            runWorkflowFile(workflowPath, cwd);
-            const dto: RunResponse = {
-              taskId: data.task.id, title: data.task.title,
-              status: data.status, prompt: data.prompt,
-            };
-            return jsonResponse(dto);
-          },
-          (e) => errorResponse(e),
-        );
-      }
+        const workflowPath = `.claude/workflows/${parsed.output.type}.yml`;
+        const result = runWorkflowFile(workflowPath, cwd);
 
-      case "done": {
-        const parsed = v.safeParse(DoneArgsSchema, args);
-        if (!parsed.success) return validationError(parsed.issues);
-        return completeTask(workflows, store, parsed.output, transcriptStore.path).match(
-          (data) => {
-            if (data.next.length === 0) notifyTaskResult(notifiers, store, data.task, "task.done", { output: data.output });
-            notifyIfGroupSettled(notifiers, store, data.task);
-            const dto: DoneResponse = {
-              taskId: data.task.id, title: data.task.title,
-              status: data.status, output: data.output,
-              next: data.next.length > 0 ? data.next : undefined,
-            };
-            return jsonResponse(dto);
-          },
-          (e) => errorResponse(e),
-        );
-      }
-
-      case "reject": {
-        const parsed = v.safeParse(RejectArgsSchema, args);
-        if (!parsed.success) return validationError(parsed.issues);
-        return rejectTask(store, parsed.output).match(
-          (data) => {
-            notifyTaskResult(notifiers, store, data.task, "task.rejected", { reason: data.reason });
-            notifyIfGroupSettled(notifiers, store, data.task);
-            const dto: RejectResponse = {
-              taskId: data.task.id, title: data.task.title,
-              status: data.status, reason: data.reason,
-            };
-            return jsonResponse(dto);
-          },
+        return result.match(
+          (r) => jsonResponse({ status: "completed", ...r }),
           (e) => errorResponse(e),
         );
       }
@@ -244,9 +146,25 @@ function configureMcpServer(server: Server, ctx: McpContext) {
       case "status": {
         const parsed = v.safeParse(StatusArgsSchema, args);
         if (!parsed.success) return validationError(parsed.issues);
-        return getStatus(store, parsed.output.taskId).match(
-          (data) => jsonResponse(data),
-          (e) => errorResponse(e),
+
+        if (parsed.output.runId) {
+          return jsonResponse(
+            JSON.parse(runActrunCommand(["run", "view", parsed.output.runId, "--json"], cwd)),
+          );
+        }
+        return jsonResponse(
+          JSON.parse(runActrunCommand(["run", "list", "--json", "--limit", "10"], cwd)),
+        );
+      }
+
+      case "logs": {
+        const parsed = v.safeParse(LogsArgsSchema, args);
+        if (!parsed.success) return validationError(parsed.issues);
+
+        const logsArgs = ["run", "logs", parsed.output.runId, "--json"];
+        if (parsed.output.failedOnly) logsArgs.push("--log-failed");
+        return jsonResponse(
+          JSON.parse(runActrunCommand(logsArgs, cwd)),
         );
       }
 
@@ -270,30 +188,15 @@ function newMcpServer() {
   );
 }
 
-function createServerCore(workflowsDir: string) {
+export function createServer(workflowsDir: string) {
   const { workflows, errors } = loadWorkflows(workflowsDir);
   for (const e of errors) {
     console.error(`[actrun-mcp] workflow error: ${e.file}: ${e.message}`);
   }
-  return { workflows, store: new TaskStore(createDb()) };
-}
-
-
-export function createServer(workflowsDir: string) {
-  const { workflows, store } = createServerCore(workflowsDir);
   const server = newMcpServer();
-  const notifiers = new Map<string, NotifyFn>();
-  const callerId = "default";
-
-  notifiers.set(callerId, (event, params) => {
-    server
-      .sendLoggingMessage({ level: "info", logger: "actrun-mcp", data: { event, ...params } })
-      .catch(() => {});
-  });
-
   const transcriptStore: { path?: string } = {};
-  configureMcpServer(server, { workflows, store, callerId, notifiers, transcriptStore, cwd: process.cwd() });
-  return { server, store, workflows };
+  configureMcpServer(server, { workflows, transcriptStore, cwd: process.cwd() });
+  return { server, workflows };
 }
 
 export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "port"> & Partial<ServerConfig>) {
@@ -302,8 +205,10 @@ export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "p
     cwd: process.cwd(),
     ...config,
   };
-  const { workflows, store } = createServerCore(fullConfig.workflowsDir);
-  const notifiers = new Map<string, NotifyFn>();
+  const { workflows, errors } = loadWorkflows(fullConfig.workflowsDir);
+  for (const e of errors) {
+    console.error(`[actrun-mcp] workflow error: ${e.file}: ${e.message}`);
+  }
   const transcriptStore: { path?: string } = {};
   const verifyEvidence = createDefaultVerifier();
   const sessions = new Map<
@@ -312,30 +217,20 @@ export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "p
   >();
 
   function createSession(): WebStandardStreamableHTTPServerTransport {
-    const callerId = crypto.randomUUID();
     const server = newMcpServer();
 
     const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => callerId,
+      sessionIdGenerator: () => crypto.randomUUID(),
       onsessioninitialized: (sessionId) => {
         sessions.set(sessionId, { transport, server });
       },
     });
 
     transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-        notifiers.delete(transport.sessionId);
-      }
+      if (transport.sessionId) sessions.delete(transport.sessionId);
     };
 
-    notifiers.set(callerId, (event, params) => {
-      server
-        .sendLoggingMessage({ level: "info", logger: "actrun-mcp", data: { event, ...params } })
-        .catch(() => {});
-    });
-
-    configureMcpServer(server, { workflows, store, callerId, notifiers, transcriptStore, verifyEvidence, cwd: fullConfig.cwd });
+    configureMcpServer(server, { workflows, transcriptStore, verifyEvidence, cwd: fullConfig.cwd });
     server.connect(transport);
 
     return transport;
@@ -353,13 +248,8 @@ export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "p
       const sessionId = req.headers.get("mcp-session-id");
       const existing = sessionId ? sessions.get(sessionId) : undefined;
 
-      if (existing) {
-        return existing.transport.handleRequest(req);
-      }
-
-      if (sessionId) {
-        return new Response("Session not found", { status: 404 });
-      }
+      if (existing) return existing.transport.handleRequest(req);
+      if (sessionId) return new Response("Session not found", { status: 404 });
 
       if (req.method === "POST") {
         let body: unknown;
