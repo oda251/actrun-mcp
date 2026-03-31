@@ -9,7 +9,6 @@ import * as v from "valibot";
 import { loadWorkflows } from "./workflow-loader.js";
 import { runWorkflowFile } from "./job-runner.js";
 import { runActrunCommand } from "./actrun-cli.js";
-import { createDefaultVerifier, runIntentGate, type EvidenceVerifier } from "./intent-gate.js";
 import { defaults, serverUrl, type ServerConfig } from "./config.js";
 import type { Workflow } from "./types.js";
 import {
@@ -95,12 +94,11 @@ const LogsArgsSchema = v.object({
 interface McpContext {
   workflows: Map<string, Workflow>;
   transcriptStore: { path?: string };
-  verifyEvidence?: EvidenceVerifier;
   cwd: string;
 }
 
 function configureMcpServer(server: Server, ctx: McpContext) {
-  const { workflows, transcriptStore, verifyEvidence, cwd } = ctx;
+  const { workflows, transcriptStore, cwd } = ctx;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOL_DEFINITIONS,
@@ -128,11 +126,6 @@ function configureMcpServer(server: Server, ctx: McpContext) {
 
         const workflow = workflows.get(parsed.output.type);
         if (!workflow) return errorResponse(`Unknown workflow: ${parsed.output.type}`);
-
-        if (verifyEvidence) {
-          const gate = await runIntentGate(parsed.output.inputs, verifyEvidence, transcriptStore.path);
-          if (gate.isErr()) return errorResponse(gate.error);
-        }
 
         const workflowPath = `.claude/workflows/${parsed.output.type}.yml`;
         const result = runWorkflowFile(workflowPath, cwd);
@@ -210,7 +203,6 @@ export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "p
     console.error(`[actrun-mcp] workflow error: ${e.file}: ${e.message}`);
   }
   const transcriptStore: { path?: string } = {};
-  const verifyEvidence = createDefaultVerifier();
   const sessions = new Map<
     string,
     { transport: WebStandardStreamableHTTPServerTransport; server: Server }
@@ -230,7 +222,7 @@ export async function startServer(config: Pick<ServerConfig, "workflowsDir" | "p
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
 
-    configureMcpServer(server, { workflows, transcriptStore, verifyEvidence, cwd: fullConfig.cwd });
+    configureMcpServer(server, { workflows, transcriptStore, cwd: fullConfig.cwd });
     server.connect(transport);
 
     return transport;
