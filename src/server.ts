@@ -19,7 +19,7 @@ import {
   getSettledGroup,
 } from "./handlers.js";
 import type { Workflow, Task } from "./types.js";
-import { runJob } from "./job-runner.js";
+import { runWorkflowFile } from "./job-runner.js";
 import { defaults, serverUrl, type ServerConfig } from "./config.js";
 import { createDefaultVerifier, runIntentGate, type EvidenceVerifier } from "./intent-gate.js";
 import {
@@ -194,13 +194,8 @@ function configureMcpServer(server: Server, ctx: McpContext) {
 
         return runWorkflow(workflows, store, { ...parsed.output, caller: callerId, transcriptPath: transcriptStore.path }).match(
           (data) => {
-            // TODO: DAG resolution — for now run the workflow via actrun
-            const wf = workflows.get(data.task.type);
-            if (wf) {
-              // Fire and forget — actrun runs jobs, skill-action calls done/reject via MCP
-              const workflowPath = `.claude/workflows/${data.task.type}.yml`;
-              runJob(workflowPath, data.task.type.split("/").pop() ?? "", cwd);
-            }
+            const workflowPath = `.claude/workflows/${data.task.type}.yml`;
+            runWorkflowFile(workflowPath, cwd);
             const dto: RunResponse = {
               taskId: data.task.id, title: data.task.title,
               status: data.status, prompt: data.prompt,
