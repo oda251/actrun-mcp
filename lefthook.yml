@@ -1,0 +1,7 @@
+pre-commit:
+  commands:
+    lint:
+      glob: "*.{ts,tsx}"
+      run: bun x oxlint -c oxlintrc.json {staged_files}
+    typecheck:
+      run: bun x tsc --noEmit

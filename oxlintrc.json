@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicolo-ribaudo/oxc-config-store/main/oxlintrc.json",
+  "rules": {
+    "no-explicit-any": "error",
+    "no-var": "error",
+    "prefer-const": "warn",
+    "eqeqeq": "error",
+    "no-unused-vars": "warn",
+    "@typescript-eslint/consistent-type-imports": "warn",
+    "@typescript-eslint/no-non-null-assertion": "error",
+    "unicorn/no-thenable": "error"
+  }
+}
